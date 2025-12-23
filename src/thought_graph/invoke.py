@@ -8,20 +8,43 @@ from thought_graph.utils import get_logger
 
 logger = get_logger(__name__)
 
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"), base_url=os.getenv("OPENAI_API_BASE_URL"))
-model = os.getenv("OPENAI_API_MODEL", "gpt-4o")
+class QueryContext:
+    def __init__(self):
+        self.client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"), base_url=os.getenv("OPENAI_API_BASE_URL"))
+        self.model = os.getenv("OPENAI_API_MODEL", "gpt-4o")
+        self.prompt_buffer: list[str] = []
+        self._depth: int = 0  # [NEW] 引用计数器
 
-prompt_buffer: list[str] = []
+    @property
+    def is_active(self) -> bool:
+        return self._depth > 0
+
+    def enter(self):
+        """进入上下文：增加深度"""
+        if self._depth == 0:
+            # 只有最外层需要重置 buffer
+            self.prompt_buffer.clear()
+        self._depth += 1
+
+    def exit(self):
+        """退出上下文：减少深度"""
+        self._depth -= 1
+        if self._depth == 0:
+            # 只有最外层退出时才完全清理 (可根据需求决定是否在此处断开连接，通常保留 client)
+            self.prompt_buffer.clear()
+
+
+_query_ctx = QueryContext()
 
 def query(prompt_template: str, *args) -> Union[str, Tuple[str, ...], None]:
     formatted_text = prompt_template.format(*args)
     capture_targets = re.findall(r'\[(.*?)\]', prompt_template)
     
     if not capture_targets:
-        prompt_buffer.append(formatted_text)
+        _query_ctx.prompt_buffer.append(formatted_text)
         return None
     
-    full_context = "\n".join(prompt_buffer + [formatted_text])
+    full_context = "\n".join(_query_ctx.prompt_buffer + [formatted_text])
     
     output_sample = prompt_template.replace('[', '<').replace(']', '>').format(*args)
     
@@ -38,8 +61,8 @@ def query(prompt_template: str, *args) -> Union[str, Tuple[str, ...], None]:
         f"<OUTPUT>\n{output_sample}"
     )
 
-    response = client.chat.completions.create(
-        model=model,
+    response = _query_ctx.client.chat.completions.create(
+        model=_query_ctx.model,
         messages=[
             {"role": "system", "content": "You are a reasoning assistant. You must use the <OUTPUT> tag to finalize your answer."},
             {"role": "user", "content": full_context + instruction}
@@ -63,7 +86,7 @@ def query(prompt_template: str, *args) -> Union[str, Tuple[str, ...], None]:
     logger.debug(f"captured_values: {captured_values}")  # 调试信息
     
     # 清空缓冲区以保证下一次调用独立 [cite: 231]
-    prompt_buffer.clear()
+    _query_ctx.prompt_buffer.clear()
     
     # 验证捕获数量是否与模板一致，防止解包失败 [cite: 134, 254]
     if len(captured_values) != len(capture_targets):

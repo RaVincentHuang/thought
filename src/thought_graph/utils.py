@@ -1,7 +1,7 @@
 import logging
 import colorlog
 
-def get_logger(name: str) -> logging.Logger:
+def get_logger(name: str, console_level=logging.DEBUG, file_level=logging.ERROR) -> logging.Logger:
     """
     Get a logger with the specified name.
     
@@ -16,11 +16,11 @@ def get_logger(name: str) -> logging.Logger:
     
     # Create console handler with debug level
     console_handler = colorlog.StreamHandler()
-    console_handler.setLevel(logging.DEBUG)
+    console_handler.setLevel(console_level)
     
     # Create file handler with error level
     file_handler = logging.FileHandler(f"log/{name}.log", encoding="utf-8")
-    file_handler.setLevel(logging.ERROR)
+    file_handler.setLevel(file_level)
     
     # Create formatter and set it for both handlers
     formatter = colorlog.ColoredFormatter(

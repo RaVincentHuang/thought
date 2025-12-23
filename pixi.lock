@@ -814,7 +814,7 @@ packages:
 - pypi: .
   name: thought-graph
   version: 0.1.0
-  sha256: 65a16a6b72278661940d237ed6472d6859b59dab8beb182db60a708222d8f103
+  sha256: 58088676e0e53e0df7491f492b6eedaaf1dc15424c963c24bcd01109548a59fa
   requires_dist:
   - openai>=2.14.0,<3
   - colorlog>=6.10.1,<7

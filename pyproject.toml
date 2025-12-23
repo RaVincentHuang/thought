@@ -23,3 +23,4 @@ thought-graph = { path = ".", editable = true }
 install = "pip install --no-deps -e ."
 test-import = "python -c \"import thought_graph; print('Import success!')\""
 test-query = "python tests/test_query.py"
+test-trace = "python tests/test_trace.py"

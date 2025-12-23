@@ -1,4 +1,5 @@
 from thought_graph import query, analysis
+from thought_graph.trace import ProgramTrace, TraceEvent
 
 @analysis
 def example1(num):
@@ -6,6 +7,7 @@ def example1(num):
     num1, num2 = query("We have {}=[num1]+[num2]", num) # pyright: ignore[reportGeneralTypeIssues]
     num_prime = num1 + num2
     print(f"Decomposed {num} into {num1} and {num2}, sum is {num_prime}")
+    return num1, num2
 
 @analysis
 def update(nums: list[int], n1: int, n2: int, res: int) -> list[int]:
@@ -84,7 +86,61 @@ def solve_game24_bfs(initial_numbers: list[int]):
     print(f"Final Success: {success}")
     return success
 
+def print_trace_graph(trace: ProgramTrace, title: str):
+    """
+    辅助函数：可视化打印 Trace 数据流图
+    """
+    print(f"\n{'='*20} {title} Trace Visualization {'='*20}")
+    print(f"Total Events: {len(trace.events)}")
+    
+    for i, event in enumerate(trace.events):
+        # 格式化时间戳
+        time_offset = f"{event.timestamp - trace.events[0].timestamp:.4f}s"
+        
+        # 格式化 USE 节点列表
+        uses_str = ", ".join([str(u) for u in event.use_nodes]) if event.use_nodes else "None"
+        
+        # 格式化 DEF 节点
+        def_str = str(event.def_node)
+        
+        # 打印类似于汇编的指令流: DEF <- USE [Type]
+        print(f"[{i:03d}][{time_offset}] {event.stmt_type.upper().ljust(12)} : {def_str} <--- [{uses_str}]")
 
 if __name__ == "__main__":
-    example1(10)
-    solve_game24_bfs([3, 8, 3, 3])
+    print("Running Example 1...")
+    
+    # [关键] 最外层调用会自动拆包：返回 (结果, Trace对象)
+    # 这里的 100 是输入参数
+    result_ex1, trace_ex1 = example1(100) 
+    
+    print(f"Execution Result: {result_ex1}")
+    print_trace_graph(trace_ex1, "Example 1")
+
+    # ------------------------------------------------------------------
+    # 场景 2: 调用复杂任务 Game of 24
+    # ------------------------------------------------------------------
+    print("\n\nRunning Game of 24 BFS...")
+    
+    input_nums = [4, 1, 8, 7] # 一个有解的例子
+    
+    # 同样，最外层调用返回 (bool, Trace对象)
+    is_success, trace_bfs = solve_game24_bfs(input_nums)
+    
+    print(f"Game Solved: {is_success}")
+    
+    # 打印庞大的数据流图
+    # 你会看到从 input_nums 到 n1, n2, res, 再到 update 生成的 new_nums 的完整链路
+    print_trace_graph(trace_bfs, "Game of 24 BFS")
+    
+    # ------------------------------------------------------------------
+    # 进阶分析：查看特定变量的依赖链 (简单的后向切片演示)
+    # ------------------------------------------------------------------
+    if trace_bfs.events:
+        print("\n[Analysis] Trace Summary:")
+        llm_calls = [e for e in trace_bfs.events if e.stmt_type == 'llm_invoke']
+        side_effects = [e for e in trace_bfs.events if e.stmt_type == 'side_effect']
+        return_passes = [e for e in trace_bfs.events if e.stmt_type == 'return_pass']
+        
+        print(f"  - LLM Invocations: {len(llm_calls)}")
+        print(f"  - Side Effects (Function Updates): {len(side_effects)}")
+        print(f"  - Return Values Passed: {len(return_passes)}")
