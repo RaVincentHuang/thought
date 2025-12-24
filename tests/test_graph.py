@@ -1,7 +1,9 @@
 from thought_graph import query, analysis, query_iter
 from thought_graph.trace import ProgramTrace, TraceEvent
+from thought_graph.graph import DataFlowGraph, ThoughtGraph
+from thought_graph.analysis import AnalysisOutput
 
-@analysis
+@analysis(output_type=AnalysisOutput.THOUGHT)
 def example1(num):
     query("Input number {}", num)
     num1, num2 = query("We have {}=[num1]+[num2]", num) # pyright: ignore[reportGeneralTypeIssues]
@@ -35,15 +37,11 @@ def update(nums: list[int], n1: int, n2: int, res: int) -> list[int]:
 
 @analysis
 def analysis_status(nums: list[int]) -> float:
-    score_str = query(
-        "Evaluate the potential of these numbers {} to reach 24. "
-        "Provide a confidence score from 0 to 10: [score]",
-        nums
-    )
+    score_str = query("Evaluate the potential of these numbers {} to reach 24. ""Provide a confidence score from 0 to 10: [score]", nums)
     # 记录该 DEF 事件，标记为 LLM 定义的评分节点 [cite: 231, 399]
     return float(score_str)
 
-@analysis
+@analysis(output_type=AnalysisOutput.THOUGHT)
 def solve_game24_bfs(initial_numbers: list[int]):
     """
     使用 BFS 逻辑实现 Game of 24 的 ToT 推理
@@ -62,22 +60,15 @@ def solve_game24_bfs(initial_numbers: list[int]):
             
             # 2. 触发独立 Invoke：捕获两个操作数和结果 [cite: 231, 256]
             # 假设 LLM 严格遵守 <OUTPUT> 协议返回 [n1][n2][res]
-            n1, n2, res = query(
-                "Pick two numbers from {} and their sum/sub/mul/div result: [n1], [n2], [res]", 
-                nums
-            )
+            n1, n2, res = query("Pick two numbers from {} and their sum/sub/mul/div result: [n1], [n2], [res]", nums)
             
             # 3. 更新状态：移除已使用的数字，加入新结果 [cite: 256, 347]
             new_nums = update(nums, int(n1), int(n2), int(res))
             
             next_states.append(new_nums)
             print(f"Action: {n1} & {n2} -> {res} | New State: {new_nums}")
-        
-        candidates = sorted(
-            next_states, 
-            key=lambda ns: analysis_status(ns), 
-            reverse=True
-        )
+
+        candidates = sorted(next_states, key=lambda ns: analysis_status(ns), reverse=True)
         # BFS 宽度限制：每层保留前 3 个状态 [cite: 598]
         states = candidates[:3]
 
@@ -111,11 +102,9 @@ if __name__ == "__main__":
     
     # [关键] 最外层调用会自动拆包：返回 (结果, Trace对象)
     # 这里的 100 是输入参数
-    result_ex1, trace_ex1 = example1(100) 
-    
-    print(f"Execution Result: {result_ex1}")
-    print_trace_graph(trace_ex1, "Example 1")
+    result_ex1, thought_ex1 = example1(100) 
 
+    thought_ex1.print_summary()
     # ------------------------------------------------------------------
     # 场景 2: 调用复杂任务 Game of 24
     # ------------------------------------------------------------------
@@ -124,23 +113,12 @@ if __name__ == "__main__":
     input_nums = [4, 1, 8, 7] # 一个有解的例子
     
     # 同样，最外层调用返回 (bool, Trace对象)
-    is_success, trace_bfs = solve_game24_bfs(input_nums)
+    is_success, thought_game24 = solve_game24_bfs(input_nums)
+    
+    thought_game24.print_summary()
     
     print(f"Game Solved: {is_success}")
     
     # 打印庞大的数据流图
     # 你会看到从 input_nums 到 n1, n2, res, 再到 update 生成的 new_nums 的完整链路
-    print_trace_graph(trace_bfs, "Game of 24 BFS")
     
-    # ------------------------------------------------------------------
-    # 进阶分析：查看特定变量的依赖链 (简单的后向切片演示)
-    # ------------------------------------------------------------------
-    if trace_bfs.events:
-        print("\n[Analysis] Trace Summary:")
-        llm_calls = [e for e in trace_bfs.events if e.stmt_type == 'llm_invoke']
-        side_effects = [e for e in trace_bfs.events if e.stmt_type == 'side_effect']
-        return_passes = [e for e in trace_bfs.events if e.stmt_type == 'return_pass']
-        
-        print(f"  - LLM Invocations: {len(llm_calls)}")
-        print(f"  - Side Effects (Function Updates): {len(side_effects)}")
-        print(f"  - Return Values Passed: {len(return_passes)}")

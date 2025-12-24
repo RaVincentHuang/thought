@@ -211,3 +211,5 @@ __marimo__/
 *.egg-info
 
 .vscode/
+
+temp.txt

@@ -88,6 +88,7 @@ class LineParser(ast.NodeVisitor):
         self.defs: Set[str] = set()
         self.uses: Set[str] = set()
         self.has_query_call: bool = False # 标记当前行是否调用了 query
+        self.is_for_loop: bool = False
         self.return_var: Optional[str] = None # [NEW] 记录 return 的变量名
 
     def visit_Name(self, node):
@@ -100,23 +101,20 @@ class LineParser(ast.NodeVisitor):
     def visit_Call(self, node):
         # [NEW] 启发式检测：识别 x.append(...) 这种副作用调用
         if isinstance(node.func, ast.Attribute):
-            method_name = node.func.attr
-            if method_name in MUTATION_METHODS:
-                # 如果调用主体是一个变量名 (e.g., data.append)
-                if isinstance(node.func.value, ast.Name):
-                    var_name = node.func.value.id
-                    # 这是一个副作用修改，我们将 var_name 视为 DEF
-                    # 这样 Trace 系统就会为它生成新版本 (v_old -> v_new)
-                    self.defs.add(var_name)
+            if node.func.attr in MUTATION_METHODS and isinstance(node.func.value, ast.Name):
+                self.defs.add(node.func.value.id)
         
         # [NEW] 检测函数调用是否为 'query'
         # 简单情况：直接调用 query(...)
         # TODO: 处理更复杂情况，如别名调用等
-        if isinstance(node.func, ast.Name) and node.func.id == 'query':
-            self.has_query_call = True
-        # 处理属性调用情况：dsl.query(...)
-        elif isinstance(node.func, ast.Attribute) and node.func.attr == 'query':
-            self.has_query_call = True
+        func_name = ""
+        if isinstance(node.func, ast.Name):
+            func_name = node.func.id
+        elif isinstance(node.func, ast.Attribute):
+            func_name = node.func.attr
+            
+        if func_name in ('query', 'query_iter'):
+            self.is_query = True
             
         self.generic_visit(node)
 
@@ -129,18 +127,31 @@ class LineParser(ast.NodeVisitor):
         if node.value and isinstance(node.value, ast.Name):
             self.return_var = node.value.id
         self.generic_visit(node)
+    
+    def visit_For(self, node):
+        self.is_for_loop = True
+        # Target 是 DEF (例如 x)
+        self.visit(node.target) 
+        # Iter 是 USE (例如 nums)
+        self.visit(node.iter)
+        # 不继续遍历 body，因为我们只关心这一行 Header
         
-def parse_line_analysis(source_line: str) -> Tuple[Set[str], Set[str], bool, Optional[str]]:
+def parse_line_analysis(source_line: str) -> Tuple[Set[str], Set[str], bool, Optional[str], bool]:
     """返回 (defs, uses, has_query_call, return_var)"""
+    clean_line = textwrap.dedent(source_line).strip()
+    if clean_line.startswith(("for ", "while ", "if ", "elif ", "with ", "def ", "class ", "try:", "except:", "else:", "finally:")):
+        if not clean_line.endswith(":"): clean_line += ":"
+        clean_line += " pass"
+    
     try:
-        tree = ast.parse(textwrap.dedent(source_line))
+        tree = ast.parse(textwrap.dedent(clean_line))
         parser = LineParser()
         parser.visit(tree)
         # 如果是赋值语句 a = query(...)，parser.defs 会包含 a
         # 如果是表达式语句 query(...)，parser.defs 为空
-        return parser.defs, parser.uses, parser.has_query_call, parser.return_var
+        return parser.defs, parser.uses, parser.has_query_call, parser.return_var, parser.is_for_loop
     except SyntaxError:
-        return set(), set(), False, None
+        return set(), set(), False, None, False
 
 def expand_object_keys(obj: Any) -> List[KeyType]:
     """
@@ -177,8 +188,11 @@ class DeferredLineContext:
     defs: Set[str]
     is_query: bool
     return_var: Optional[str]
+    is_for_loop: bool
     # [PERFECT FIX] Snapshot: 记录执行前 USE 变量的 Keys
     use_snapshots: Dict[str, List[KeyType]] = field(default_factory=dict)
+    use_objects_ref: Dict[str, Any] = field(default_factory=dict)
+
 
 class ExecutionTracer:
     def __init__(self):
@@ -201,8 +215,25 @@ class ExecutionTracer:
             # 1. 构建 USE 节点 (基于 Snapshot)
             # 因为变量在 Line N 执行过程中可能被修改(e.g. pop)，所以必须用执行前的 Keys
             current_use_nodes = []
+            is_llm_def = False
             
-            if ctx.is_query:
+            if ctx.is_for_loop and ctx.is_query:
+                # 这是一个生成式循环
+                # 依赖项 = QueryIter 的输入参数 (in use_snapshots)
+                # 我们不需要反向查找，因为每一轮的值都是由 LLM "凭空" 生成的（基于 Context）
+                for use_var, keys in ctx.use_snapshots.items():
+                    for key in keys:
+                        current_use_nodes.append(global_trace.get_current_node(scope_id, use_var, key))
+                
+                # 同时也消费可能存在的 buffer (通常是第一轮循环会用到)
+                # 注意：后续轮次 buffer 为空，但依赖依然存在于 use_snapshots 中，这是正确的
+                buffered_deps = global_trace.consume_query_dependencies()
+                current_use_nodes.extend(buffered_deps)
+                
+                stmt_type = 'llm_iter' # 专门的事件类型
+                is_llm_def = True      # 标记为 LLM 输出
+            
+            elif ctx.is_query:
                 # Query 模式：依赖 Snapshot 中的所有 keys
                 line_uses = []
                 for use_var, keys in ctx.use_snapshots.items():
@@ -219,7 +250,53 @@ class ExecutionTracer:
                 buffered_deps = global_trace.consume_query_dependencies()
                 current_use_nodes = line_uses + buffered_deps
                 stmt_type = 'llm_invoke'
-            
+                is_llm_def = True
+            elif ctx.is_for_loop:
+                # [NEW] For 循环的特殊处理
+                # 我们需要找到 def_val 对应 use_obj 中的哪个 key (Index)
+                # 这是一个"反向查找"过程
+                
+                # 假设通常只有一个 iterator (for x in nums)
+                # 如果有多个 (for x in zip(a, b)) 情况较复杂，这里优先处理单迭代器
+                iterator_var_name = list(ctx.use_snapshots.keys())[0]
+                iterator_obj = ctx.use_objects_ref.get(iterator_var_name)
+                
+                # 获取当前循环变量的值 (DEF value)
+                # 假设只有一个 target (for x in ...)
+                loop_var_name = list(ctx.defs)[0] if ctx.defs else None
+                current_loop_val = frame.f_locals.get(loop_var_name) if loop_var_name else None
+                
+                matched_key = None
+                
+                # 尝试反向匹配：在 iterator_obj 中寻找 current_loop_val
+                if iterator_obj is not None and current_loop_val is not None:
+                    # Case List/Tuple: 寻找 value 相同的 index
+                    if isinstance(iterator_obj, (list, tuple)):
+                        # 优先匹配 Identity (is)
+                        for i, item in enumerate(iterator_obj):
+                            if item is current_loop_val:
+                                matched_key = i
+                                break
+                        # 回退匹配 Equality (==)
+                        if matched_key is None:
+                            for i, item in enumerate(iterator_obj):
+                                if item == current_loop_val:
+                                    matched_key = i
+                                    break
+                    
+                    # Case Dict: 迭代的是 Key
+                    elif isinstance(iterator_obj, dict):
+                        if current_loop_val in iterator_obj:
+                            matched_key = current_loop_val # Key 就是 Value
+                
+                # 如果找到了精确的 Key，就只依赖这个 Key
+                if matched_key is not None:
+                    current_use_nodes.append(global_trace.get_current_node(scope_id, iterator_var_name, matched_key))
+                else:
+                    # 没找到 (或者是 generator 等无法遍历的)，依赖整体
+                    current_use_nodes.append(global_trace.get_current_node(scope_id, iterator_var_name, None))
+                
+                stmt_type = 'loop_iter'
             else:
                 # 普通赋值模式
                 for use_var, keys in ctx.use_snapshots.items():
@@ -237,8 +314,9 @@ class ExecutionTracer:
                 
                 for key in def_keys:
                     # 创建新版本
-                    def_node = global_trace.new_def_node(scope_id, def_name, key)
-                    
+                    val = get_value_by_key(def_obj, key)
+                    def_node = global_trace.new_def_node(scope_id, def_name, key, val, is_query_output=is_llm_def)
+
                     # 匹配逻辑 (简化为全量依赖，真正的 Element-wise 需更复杂 AST 分析)
                     global_trace.add_event(def_node, current_use_nodes, stmt_type)
             
@@ -252,7 +330,8 @@ class ExecutionTracer:
                     
                     for key in ret_keys:
                         # Def(Caller.Target) <- Use(Callee.ReturnVar)
-                        def_node = global_trace.new_def_node(pending.scope_id, pending.target_var, key)
+                        val = get_value_by_key(ret_obj, key)
+                        def_node = global_trace.new_def_node(pending.scope_id, pending.target_var, key, val)
                         use_node = global_trace.get_current_node(scope_id, ctx.return_var, key)
                         global_trace.add_event(def_node, [use_node], 'return_pass')
 
@@ -276,6 +355,9 @@ class ExecutionTracer:
         if event == 'call':
             logger.debug(f"CALL event in {code.co_name}, function call is {code}.")
             if code in DECORATED_CODE_OBJECTS:
+                
+                is_entry_point = (len(global_trace._frame_stack) == 0)
+                
                 global_trace.push_frame(scope_id)
                 curr_ctx = global_trace.current_frame()
 
@@ -284,7 +366,8 @@ class ExecutionTracer:
                 # 处理临时赋值目标
                 if self._temp_call_target:
                     curr_ctx.return_target = self._temp_call_target
-                    global_trace.push_assignment(self._temp_call_target, str(id(frame.f_back)))
+                    parent_scope = str(id(frame.f_back)) if frame.f_back else "unknown"
+                    global_trace.push_assignment(self._temp_call_target, parent_scope)
                     self._temp_call_target = None
 
                 # 解析参数传递
@@ -321,7 +404,8 @@ class ExecutionTracer:
                                     for key in keys:
                                         # Arg Pass Event
                                         use_node = global_trace.get_current_node(caller_scope, actual_name, key)
-                                        def_node = global_trace.new_def_node(scope_id, formal_name, key)
+                                        val = get_value_by_key(arg_obj, key)
+                                        def_node = global_trace.new_def_node(scope_id, formal_name, key, val)
                                         global_trace.add_event(def_node, [use_node], 'arg_pass')
                                         
                                         # 记录进入时的版本 (用于 Side Effect 检测)
@@ -330,6 +414,24 @@ class ExecutionTracer:
                                     curr_ctx.arg_trackers.append(tracker)
                     except Exception:
                         pass
+                
+                if is_entry_point:
+                    for formal_name in formal_args:
+                        if formal_name == 'self': continue
+                        if formal_name in frame.f_locals:
+                            arg_obj = frame.f_locals[formal_name]
+                            keys = expand_object_keys(arg_obj)
+                            for key in keys:
+                                val = get_value_by_key(arg_obj, key)
+                                # [MODIFIED] 显式标记 is_root_param=True
+                                # 注意：如果是递归调用的入口(frame_stack!=0)，这里不应该标记
+                                # new_def_node 会增加版本(v0)，并记录为 ROOT
+                                def_node = global_trace.new_def_node(
+                                    scope_id, formal_name, key, val_obj=val, 
+                                    is_root_param=True
+                                )
+                                global_trace.add_event(def_node, [], 'root_param')
+                
                 logger.debug(f"END OF CALL event in {code.co_name}.")
                 return self.trace_callback
             logger.debug(f"END OF CALL event in {code.co_name}.")
@@ -371,7 +473,8 @@ class ExecutionTracer:
                                     is_changed = True
                                     
                             if is_changed:
-                                def_node = global_trace.new_def_node(tracker.caller_scope, tracker.caller_var, key)
+                                val = get_value_by_key(final_obj, key)
+                                def_node = global_trace.new_def_node(tracker.caller_scope, tracker.caller_var, key, val)
                                 # Side effect 依赖于函数结束时的状态
                                 use_node = global_trace.get_current_node(scope_id, tracker.callee_arg, key)
                                 global_trace.add_event(def_node, [use_node], 'side_effect')
@@ -393,17 +496,20 @@ class ExecutionTracer:
                 lineno = frame.f_lineno - start_line
                 if 0 <= lineno < len(lines):
                     source_line = lines[lineno]
-                    defs, uses, is_query, return_var = parse_line_analysis(source_line)
+                    defs, uses, is_query, return_var, is_for_loop = parse_line_analysis(source_line)
 
                     # [PERFECT FIX] Snapshot Logic
                     # 在代码执行前，记录所有 USE 变量的 keys
                     use_snapshots = {}
+                    use_objects_ref = {}
+                    
                     for use_var in uses:
                         # 查找变量对象
                         obj = frame.f_locals.get(use_var, frame.f_globals.get(use_var))
                         # 记录 Keys 快照
                         if obj is not None:
                             use_snapshots[use_var] = expand_object_keys(obj)
+                            use_objects_ref[use_var] = obj
                         else:
                             # 变量可能尚未定义或不可达
                             use_snapshots[use_var] = [None]
@@ -422,7 +528,9 @@ class ExecutionTracer:
                             defs=defs,
                             is_query=is_query,
                             return_var=return_var,
-                            use_snapshots=use_snapshots # <-- 存入快照
+                            use_snapshots=use_snapshots, # <-- 存入快照
+                            use_objects_ref=use_objects_ref, # <-- 存入对象引用
+                            is_for_loop=is_for_loop
                         )
 
             except Exception:

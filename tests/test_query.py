@@ -1,4 +1,4 @@
-from thought_graph import query, analysis
+from thought_graph import query, analysis, query_iter
 
 @analysis
 def example1(num):
@@ -33,11 +33,7 @@ def update(nums: list[int], n1: int, n2: int, res: int) -> list[int]:
 
 @analysis
 def analysis_status(nums: list[int]) -> float:
-    score_str = query(
-        "Evaluate the potential of these numbers {} to reach 24. "
-        "Provide a confidence score from 0 to 10: [score]",
-        nums
-    )
+    score_str = query("Evaluate the potential of these numbers {} to reach 24. ""Provide a confidence score from 0 to 10: [score]", nums)
     # 记录该 DEF 事件，标记为 LLM 定义的评分节点 [cite: 231, 399]
     return float(score_str)
 
@@ -60,10 +56,7 @@ def solve_game24_bfs(initial_numbers: list[int]):
             
             # 2. 触发独立 Invoke：捕获两个操作数和结果 [cite: 231, 256]
             # 假设 LLM 严格遵守 <OUTPUT> 协议返回 [n1][n2][res]
-            n1, n2, res = query(
-                "Pick two numbers from {} and their sum/sub/mul/div result: [n1], [n2], [res]", 
-                nums
-            )
+            n1, n2, res = query("Pick two numbers from {} and their sum/sub/mul/div result: [n1], [n2], [res]", nums)
             
             # 3. 更新状态：移除已使用的数字，加入新结果 [cite: 256, 347]
             new_nums = update(nums, int(n1), int(n2), int(res))
@@ -71,11 +64,7 @@ def solve_game24_bfs(initial_numbers: list[int]):
             next_states.append(new_nums)
             print(f"Action: {n1} & {n2} -> {res} | New State: {new_nums}")
         
-        candidates = sorted(
-            next_states, 
-            key=lambda ns: analysis_status(ns), 
-            reverse=True
-        )
+        candidates = sorted(next_states, key=lambda ns: analysis_status(ns), reverse=True)
         # BFS 宽度限制：每层保留前 3 个状态 [cite: 598]
         states = candidates[:3]
 
@@ -84,7 +73,30 @@ def solve_game24_bfs(initial_numbers: list[int]):
     print(f"Final Success: {success}")
     return success
 
+@analysis
+def analysis_nums(nums: str) -> float:
+    score_str = query("Evaluate the potential of these numbers {} to reach 24. ""Provide a confidence score from 0 to 10: [score]", nums)
+    return float(score_str)
+
+# nums: '3, 8, 3, 3'
+@analysis
+def game24(nums: str) -> bool:
+    states: list[str] = [nums]
+    for step in range(3):
+        next_states: list[str] = []
+        for state in states:
+            query("Goal: Use numbers to get 24. Current numbers: {}", state)
+            query("Pick two numbers from {} and their sum/sub/mul/div", state)
+            for nums in query_iter("result in new numbers: [numbers]"):
+                next_states.append(nums)
+        candidates: list[str] = sorted(next_states, key=lambda ns: analysis_nums(ns), reverse=True)
+        states = candidates[:3]
+    success = any("24" in s.split(", ") for s in states)
+    print(f"Final Success: {success}")
+
+    return success
 
 if __name__ == "__main__":
     example1(10)
     solve_game24_bfs([3, 8, 3, 3])
+    game24("3, 8, 3, 3")

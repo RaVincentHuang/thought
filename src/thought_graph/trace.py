@@ -1,6 +1,7 @@
 from dataclasses import dataclass, field
 from typing import List, Dict, Set, Optional, Any, Tuple, Union
 import time
+import copy
 
 # 确保 KeyType 是 Hashable 的，以作为字典的键
 KeyType = Union[int, str, Tuple[Any, ...], None]
@@ -13,6 +14,12 @@ class VariableNode:
     
     key: KeyType = None
     version: int = 0
+    
+    obj_type: type = type(None)  # 记录变量的类型信息
+    value: Any = None  # 记录变量的值快照
+    
+    is_query_output: bool = False  # 是否为 Query 直接生成的
+    is_root_param: bool = False    # 是否为最外层分析函数的参数
 
     def __repr__(self):
         # 格式化输出: a[0]_v1, d['k']_v2, s{val}_v1
@@ -26,6 +33,9 @@ class VariableNode:
     
     def __eq__(self, other):
         return (self.name, self.version, self.scope_id, self.key) == (other.name, other.version, other.scope_id, other.key)
+    
+    def __hash__(self):
+        return hash((self.name, self.scope_id, self.key, self.version))
 
 @dataclass
 class TraceEvent:
@@ -108,12 +118,8 @@ class ProgramTrace:
     def get_current_node(self, scope_id: str, var_name: str, key: KeyType = None) -> VariableNode:
         """获取变量的当前版本节点（用于 USE）"""        
         v_map = self._get_version_map(scope_id, var_name)
-        
         if key not in v_map:
             v_map[key] = 0
-        else:
-            v_map[key] += 1
-
         return VariableNode(var_name, scope_id, key, v_map[key])
     
     def get_current_version(self, scope_id: str, var_name: str, key: KeyType = None) -> int:
@@ -121,7 +127,7 @@ class ProgramTrace:
         v_map = self._get_version_map(scope_id, var_name)
         return v_map.get(key, 0)
 
-    def new_def_node(self, scope_id: str, var_name: str, key: KeyType = None) -> VariableNode:
+    def new_def_node(self, scope_id: str, var_name: str, key: KeyType = None, val_obj: Any = None, is_query_output: bool = False, is_root_param: bool = False) -> VariableNode:
         """[MODIFIED] 为变量的特定 Key 创建新版本"""
         v_map = self._get_version_map(scope_id, var_name)
         
@@ -129,8 +135,17 @@ class ProgramTrace:
             v_map[key] = 0
         else:
             v_map[key] += 1
-            
-        return VariableNode(var_name, scope_id, key, v_map[key])
+        stored_val = val_obj
+        if val_obj is not None:
+            if isinstance(val_obj, (list, dict, set)):
+                try:
+                    stored_val = copy.deepcopy(val_obj)
+                except Exception:
+                    stored_val = val_obj  # 回退到原始对象
+            else:
+                stored_val = copy.copy(val_obj)
+        
+        return VariableNode(var_name, scope_id, key, v_map[key], type(val_obj), stored_val, is_query_output, is_root_param)
 
     def add_event(self, def_node: VariableNode, use_nodes: List[VariableNode], stmt_type: str):
         event = TraceEvent(def_node, use_nodes, stmt_type, time.time())
