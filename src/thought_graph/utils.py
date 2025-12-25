@@ -1,7 +1,7 @@
 import logging
 import colorlog
 
-def get_logger(name: str, console_level=logging.DEBUG, file_level=logging.ERROR) -> logging.Logger:
+def get_logger(name: str, console_level=logging.INFO, file_level=logging.ERROR) -> logging.Logger:
     """
     Get a logger with the specified name.
     

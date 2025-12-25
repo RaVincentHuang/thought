@@ -7,6 +7,7 @@ from typing import Iterable, Optional, Set, Tuple, List, Any, Dict
 from .trace import KeyType, global_trace, VariableNode, MutableArgTracker
 
 from .utils import get_logger
+from .functions import SPECIAL_FUNCTION_HANDLERS
 
 import logging
 
@@ -90,6 +91,8 @@ class LineParser(ast.NodeVisitor):
         self.has_query_call: bool = False # 标记当前行是否调用了 query
         self.is_for_loop: bool = False
         self.return_var: Optional[str] = None # [NEW] 记录 return 的变量名
+        # [NEW] 记录当前行调用的主要函数名 (用于特殊处理 sorted 等)
+        self.call_func_name: Optional[str] = None
 
     def visit_Name(self, node):
         if isinstance(node.ctx, ast.Store):
@@ -107,14 +110,18 @@ class LineParser(ast.NodeVisitor):
         # [NEW] 检测函数调用是否为 'query'
         # 简单情况：直接调用 query(...)
         # TODO: 处理更复杂情况，如别名调用等
-        func_name = ""
+        func_name = None
         if isinstance(node.func, ast.Name):
             func_name = node.func.id
         elif isinstance(node.func, ast.Attribute):
             func_name = node.func.attr
             
-        if func_name in ('query', 'query_iter'):
-            self.is_query = True
+        if func_name:
+            # logger.info(f"Detected function call: {func_name}")
+            if func_name in ('query', 'query_iter'):
+                self.has_query_call = True
+            
+            self.call_func_name = func_name
             
         self.generic_visit(node)
 
@@ -135,9 +142,9 @@ class LineParser(ast.NodeVisitor):
         # Iter 是 USE (例如 nums)
         self.visit(node.iter)
         # 不继续遍历 body，因为我们只关心这一行 Header
-        
-def parse_line_analysis(source_line: str) -> Tuple[Set[str], Set[str], bool, Optional[str], bool]:
-    """返回 (defs, uses, has_query_call, return_var)"""
+
+def parse_line_analysis(source_line: str) -> Tuple[Set[str], Set[str], bool, Optional[str], bool, Optional[str]]:
+    """返回 (defs, uses, has_query_call, return_var, is_for_loop, call_func_name)"""
     clean_line = textwrap.dedent(source_line).strip()
     if clean_line.startswith(("for ", "while ", "if ", "elif ", "with ", "def ", "class ", "try:", "except:", "else:", "finally:")):
         if not clean_line.endswith(":"): clean_line += ":"
@@ -149,9 +156,9 @@ def parse_line_analysis(source_line: str) -> Tuple[Set[str], Set[str], bool, Opt
         parser.visit(tree)
         # 如果是赋值语句 a = query(...)，parser.defs 会包含 a
         # 如果是表达式语句 query(...)，parser.defs 为空
-        return parser.defs, parser.uses, parser.has_query_call, parser.return_var, parser.is_for_loop
+        return parser.defs, parser.uses, parser.has_query_call, parser.return_var, parser.is_for_loop, parser.call_func_name
     except SyntaxError:
-        return set(), set(), False, None, False
+        return set(), set(), False, None, False, None
 
 def expand_object_keys(obj: Any) -> List[KeyType]:
     """
@@ -189,9 +196,11 @@ class DeferredLineContext:
     is_query: bool
     return_var: Optional[str]
     is_for_loop: bool
+    call_func_name: Optional[str]
     # [PERFECT FIX] Snapshot: 记录执行前 USE 变量的 Keys
     use_snapshots: Dict[str, List[KeyType]] = field(default_factory=dict)
     use_objects_ref: Dict[str, Any] = field(default_factory=dict)
+    
 
 
 class ExecutionTracer:
@@ -212,6 +221,33 @@ class ExecutionTracer:
         ctx = self._deferred_buffer.pop(scope_id)
         
         try:
+            
+            if ctx.call_func_name in SPECIAL_FUNCTION_HANDLERS and ctx.defs and ctx.use_objects_ref:
+                
+                # 假设 sorted(x) 这种形式，defs通常只有一个 (candidates), use 也主要是一个 (next_states)
+                # 我们取第一个 def 和第一个主要的 use 进行尝试
+                def_name = list(ctx.defs)[0]
+                # 简单的启发式：在 use_objects_ref 中找到列表类型的输入作为源
+                # 因为 sorted 的第二个参数 key=... 中的变量通常不是数据源
+                use_name = None
+                for u_name, u_obj in ctx.use_objects_ref.items():
+                    if isinstance(u_obj, (list, tuple)):
+                        use_name = u_name
+                        break
+                
+                if def_name in frame.f_locals and use_name:
+                    def_obj = frame.f_locals[def_name]
+                    use_obj = ctx.use_objects_ref[use_name]
+                    
+                    # 调用 functions.py 中的 handler
+                    handler = SPECIAL_FUNCTION_HANDLERS[ctx.call_func_name]
+                    handled = handler(scope_id, def_name, def_obj, use_name, use_obj)
+                    
+                    if handled:
+                        # 如果处理成功，直接返回，跳过后续通用的处理逻辑
+                        # 这样就避免了生成错误的 "全量依赖" 或 "Key=None" 依赖
+                        return
+            
             # 1. 构建 USE 节点 (基于 Snapshot)
             # 因为变量在 Line N 执行过程中可能被修改(e.g. pop)，所以必须用执行前的 Keys
             current_use_nodes = []
@@ -496,7 +532,7 @@ class ExecutionTracer:
                 lineno = frame.f_lineno - start_line
                 if 0 <= lineno < len(lines):
                     source_line = lines[lineno]
-                    defs, uses, is_query, return_var, is_for_loop = parse_line_analysis(source_line)
+                    defs, uses, is_query, return_var, is_for_loop, call_func_name = parse_line_analysis(source_line)
 
                     # [PERFECT FIX] Snapshot Logic
                     # 在代码执行前，记录所有 USE 变量的 keys
@@ -530,7 +566,8 @@ class ExecutionTracer:
                             return_var=return_var,
                             use_snapshots=use_snapshots, # <-- 存入快照
                             use_objects_ref=use_objects_ref, # <-- 存入对象引用
-                            is_for_loop=is_for_loop
+                            is_for_loop=is_for_loop,
+                            call_func_name=call_func_name
                         )
 
             except Exception:

@@ -77,6 +77,29 @@ def solve_game24_bfs(initial_numbers: list[int]):
     print(f"Final Success: {success}")
     return success
 
+@analysis
+def analysis_nums(nums: str) -> float:
+    score_str = query("Evaluate the potential of these numbers {} to reach 24. ""Provide a confidence score from 0 to 10: [score]", nums)
+    return float(score_str)
+
+# nums: '3, 8, 3, 3'
+@analysis(output_type=AnalysisOutput.THOUGHT)
+def game24(nums: str) -> bool:
+    states: list[str] = [nums]
+    for step in range(3):
+        next_states: list[str] = []
+        for state in states:
+            query("Goal: Use numbers to get 24. Current numbers: {}", state)
+            query("Pick two numbers from {} and their sum/sub/mul/div", state)
+            for nums in query_iter("result in new numbers: [numbers]"):
+                next_states.append(nums)
+        candidates: list[str] = sorted(next_states, key=lambda ns: analysis_nums(ns), reverse=True)
+        states = candidates[:3]
+    success = any("24" in s.split(", ") for s in states)
+    print(f"Final Success: {success}")
+
+    return success
+
 def print_trace_graph(trace: ProgramTrace, title: str):
     """
     辅助函数：可视化打印 Trace 数据流图
@@ -118,6 +141,11 @@ if __name__ == "__main__":
     thought_game24.print_summary()
     
     print(f"Game Solved: {is_success}")
+    
+    is_success, thought_game24 = game24("3, 8, 3, 3")
+    thought_game24.print_summary()
+    
+    print(f"Game Solved (str nums): {is_success}")
     
     # 打印庞大的数据流图
     # 你会看到从 input_nums 到 n1, n2, res, 再到 update 生成的 new_nums 的完整链路
