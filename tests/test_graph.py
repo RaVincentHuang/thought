@@ -91,8 +91,8 @@ def game24(nums: str) -> bool:
         for state in states:
             query("Goal: Use numbers to get 24. Current numbers: {}", state)
             query("Pick two numbers from {} and their sum/sub/mul/div", state)
-            for nums in query_iter("result in new numbers: [numbers]"):
-                next_states.append(nums)
+            for child in query_iter("result in new numbers: [numbers]"):
+                next_states.append(child)
         candidates: list[str] = sorted(next_states, key=lambda ns: analysis_nums(ns), reverse=True)
         states = candidates[:3]
     success = any("24" in s.split(", ") for s in states)
@@ -121,26 +121,26 @@ def print_trace_graph(trace: ProgramTrace, title: str):
         print(f"[{i:03d}][{time_offset}] {event.stmt_type.upper().ljust(12)} : {def_str} <--- [{uses_str}]")
 
 if __name__ == "__main__":
-    print("Running Example 1...")
+    # print("Running Example 1...")
     
-    # [关键] 最外层调用会自动拆包：返回 (结果, Trace对象)
-    # 这里的 100 是输入参数
-    result_ex1, thought_ex1 = example1(100) 
+    # # [关键] 最外层调用会自动拆包：返回 (结果, Trace对象)
+    # # 这里的 100 是输入参数
+    # result_ex1, thought_ex1 = example1(100) 
 
-    thought_ex1.print_summary()
-    # ------------------------------------------------------------------
-    # 场景 2: 调用复杂任务 Game of 24
-    # ------------------------------------------------------------------
-    print("\n\nRunning Game of 24 BFS...")
+    # thought_ex1.print_summary()
+    # # ------------------------------------------------------------------
+    # # 场景 2: 调用复杂任务 Game of 24
+    # # ------------------------------------------------------------------
+    # print("\n\nRunning Game of 24 BFS...")
     
-    input_nums = [4, 1, 8, 7] # 一个有解的例子
+    # input_nums = [4, 1, 8, 7] # 一个有解的例子
     
-    # 同样，最外层调用返回 (bool, Trace对象)
-    is_success, thought_game24 = solve_game24_bfs(input_nums)
+    # # 同样，最外层调用返回 (bool, Trace对象)
+    # is_success, thought_game24 = solve_game24_bfs(input_nums)
     
-    thought_game24.print_summary()
+    # thought_game24.print_summary()
     
-    print(f"Game Solved: {is_success}")
+    # print(f"Game Solved: {is_success}")
     
     is_success, thought_game24 = game24("3, 8, 3, 3")
     thought_game24.print_summary()

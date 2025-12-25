@@ -5,6 +5,8 @@ from typing import Tuple, Union, List, Iterator, Optional
 
 from thought_graph.utils import get_logger
 
+from thought_graph.trace import global_trace
+
 import logging
 
 logger = get_logger(__name__)
@@ -143,6 +145,14 @@ def query_iter(prompt_template: str, *args) -> Iterator[Union[str, Tuple[str, ..
         return iter([])
 
     output_sample = prompt_template.replace('[', '<').replace(']', '>').format(*args)
+    
+    
+    # 1. 立即消费之前积累的 Context Buffer (例如之前的 query 调用)
+    buffered_deps = global_trace.consume_query_dependencies()
+    
+    # 2. 将这些依赖“冻结”在 global_trace 的暂存区中
+    # 这样，instrument.py 在处理后续的每一次循环时，都能读到这份数据
+    global_trace.set_active_iter_deps(buffered_deps)
     
     # [Prompt Engineering] 针对多次输出的强化指令
     instruction = (

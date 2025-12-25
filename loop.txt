@@ -1,0 +1,5 @@
+
+[DEBUG] Processing DEF: state@2, [is_root: False, is_query_output: False]
+[DEBUG]   USEs: ['states[0]@1']
+[DEBUG] Processing DEF: child@13, [is_root: False, is_query_output: True]
+[DEBUG]   USEs: ['query_iter@0', 'state@2', 'query@0']

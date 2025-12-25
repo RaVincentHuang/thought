@@ -85,6 +85,16 @@ class ProgramTrace:
         self._assignment_stack: List[PendingAssignment] = []
         
         self._frame_stack: List[StackFrameContext] = []
+        
+        self._active_iter_deps: List[VariableNode] = []
+    
+    def set_active_iter_deps(self, nodes: List[VariableNode]):
+        """在 query_iter 调用时，保存捕获到的 Buffer 依赖"""
+        self._active_iter_deps = nodes[:] # 浅拷贝列表
+
+    def get_active_iter_deps(self) -> List[VariableNode]:
+        """在循环的每一轮中读取依赖"""
+        return self._active_iter_deps
     
     def push_frame(self, scope_id: str):
         self._frame_stack.append(StackFrameContext(scope_id))

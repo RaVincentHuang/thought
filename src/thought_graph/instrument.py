@@ -92,7 +92,7 @@ class LineParser(ast.NodeVisitor):
         self.is_for_loop: bool = False
         self.return_var: Optional[str] = None # [NEW] 记录 return 的变量名
         # [NEW] 记录当前行调用的主要函数名 (用于特殊处理 sorted 等)
-        self.call_func_name: Optional[str] = None
+        self.called_functions: List[str] = []
 
     def visit_Name(self, node):
         if isinstance(node.ctx, ast.Store):
@@ -121,7 +121,7 @@ class LineParser(ast.NodeVisitor):
             if func_name in ('query', 'query_iter'):
                 self.has_query_call = True
             
-            self.call_func_name = func_name
+            self.called_functions.append(func_name)
             
         self.generic_visit(node)
 
@@ -143,8 +143,8 @@ class LineParser(ast.NodeVisitor):
         self.visit(node.iter)
         # 不继续遍历 body，因为我们只关心这一行 Header
 
-def parse_line_analysis(source_line: str) -> Tuple[Set[str], Set[str], bool, Optional[str], bool, Optional[str]]:
-    """返回 (defs, uses, has_query_call, return_var, is_for_loop, call_func_name)"""
+def parse_line_analysis(source_line: str) -> Tuple[Set[str], Set[str], bool, Optional[str], bool, List[str]]:
+    """返回 (defs, uses, has_query_call, return_var, is_for_loop, called_functions)"""
     clean_line = textwrap.dedent(source_line).strip()
     if clean_line.startswith(("for ", "while ", "if ", "elif ", "with ", "def ", "class ", "try:", "except:", "else:", "finally:")):
         if not clean_line.endswith(":"): clean_line += ":"
@@ -156,9 +156,9 @@ def parse_line_analysis(source_line: str) -> Tuple[Set[str], Set[str], bool, Opt
         parser.visit(tree)
         # 如果是赋值语句 a = query(...)，parser.defs 会包含 a
         # 如果是表达式语句 query(...)，parser.defs 为空
-        return parser.defs, parser.uses, parser.has_query_call, parser.return_var, parser.is_for_loop, parser.call_func_name
+        return parser.defs, parser.uses, parser.has_query_call, parser.return_var, parser.is_for_loop, parser.called_functions
     except SyntaxError:
-        return set(), set(), False, None, False, None
+        return set(), set(), False, None, False, []
 
 def expand_object_keys(obj: Any) -> List[KeyType]:
     """
@@ -196,12 +196,10 @@ class DeferredLineContext:
     is_query: bool
     return_var: Optional[str]
     is_for_loop: bool
-    call_func_name: Optional[str]
+    called_functions: List[str]
     # [PERFECT FIX] Snapshot: 记录执行前 USE 变量的 Keys
     use_snapshots: Dict[str, List[KeyType]] = field(default_factory=dict)
     use_objects_ref: Dict[str, Any] = field(default_factory=dict)
-    
-
 
 class ExecutionTracer:
     def __init__(self):
@@ -221,55 +219,70 @@ class ExecutionTracer:
         ctx = self._deferred_buffer.pop(scope_id)
         
         try:
+            active_special_handler = None
+            for f_name in ctx.called_functions:
+                if f_name in SPECIAL_FUNCTION_HANDLERS:
+                    active_special_handler = SPECIAL_FUNCTION_HANDLERS[f_name]
+                    break
             
-            if ctx.call_func_name in SPECIAL_FUNCTION_HANDLERS and ctx.defs and ctx.use_objects_ref:
+            # 如果存在特殊处理函数，且有定义变量
+            if active_special_handler and ctx.defs:
                 
-                # 假设 sorted(x) 这种形式，defs通常只有一个 (candidates), use 也主要是一个 (next_states)
-                # 我们取第一个 def 和第一个主要的 use 进行尝试
-                def_name = list(ctx.defs)[0]
-                # 简单的启发式：在 use_objects_ref 中找到列表类型的输入作为源
-                # 因为 sorted 的第二个参数 key=... 中的变量通常不是数据源
-                use_name = None
-                for u_name, u_obj in ctx.use_objects_ref.items():
-                    if isinstance(u_obj, (list, tuple)):
-                        use_name = u_name
-                        break
+                # A. 构建 DEFs Map (当前时刻的真实值)
+                defs_map = {}
+                for def_name in ctx.defs:
+                    if def_name in frame.f_locals:
+                        defs_map[def_name] = frame.f_locals[def_name]
                 
-                if def_name in frame.f_locals and use_name:
-                    def_obj = frame.f_locals[def_name]
-                    use_obj = ctx.use_objects_ref[use_name]
-                    
-                    # 调用 functions.py 中的 handler
-                    handler = SPECIAL_FUNCTION_HANDLERS[ctx.call_func_name]
-                    handled = handler(scope_id, def_name, def_obj, use_name, use_obj)
+                # B. 获取 USEs Map (执行前的对象引用)
+                uses_map = ctx.use_objects_ref
+                
+                # C. 传递全量上下文给 Handler
+                if defs_map and uses_map:
+                    # 接口变更：传入 Map，让 Handler 自己决定取哪个变量
+                    handled = active_special_handler(scope_id, defs_map, uses_map)
                     
                     if handled:
-                        # 如果处理成功，直接返回，跳过后续通用的处理逻辑
-                        # 这样就避免了生成错误的 "全量依赖" 或 "Key=None" 依赖
-                        return
+                        return # 成功处理，跳过后续通用逻辑
             
             # 1. 构建 USE 节点 (基于 Snapshot)
             # 因为变量在 Line N 执行过程中可能被修改(e.g. pop)，所以必须用执行前的 Keys
             current_use_nodes = []
             is_llm_def = False
             
+            # [Case A] Query Iter Loop (for x in query_iter(...))
             if ctx.is_for_loop and ctx.is_query:
-                # 这是一个生成式循环
-                # 依赖项 = QueryIter 的输入参数 (in use_snapshots)
-                # 我们不需要反向查找，因为每一轮的值都是由 LLM "凭空" 生成的（基于 Context）
+                is_llm_def = True
+                stmt_type = 'llm_iter'
+                
+                # 1. 获取显式参数依赖 (Explicit Args)
+                # 这些是通过 AST 解析出来的 query_iter(...) 中的参数
+                # 每一轮循环，instrument 都会重新快照这些参数，所以总是最新的
                 for use_var, keys in ctx.use_snapshots.items():
                     for key in keys:
                         current_use_nodes.append(global_trace.get_current_node(scope_id, use_var, key))
                 
-                # 同时也消费可能存在的 buffer (通常是第一轮循环会用到)
-                # 注意：后续轮次 buffer 为空，但依赖依然存在于 use_snapshots 中，这是正确的
-                buffered_deps = global_trace.consume_query_dependencies()
+                # 2. 获取隐式上下文依赖 (Context Buffer)
+                # 从 trace 的暂存区读取。这份数据在 query_iter 调用时被锁定，不会随循环清空。
+                buffered_deps = global_trace.get_active_iter_deps()
                 current_use_nodes.extend(buffered_deps)
                 
-                stmt_type = 'llm_iter' # 专门的事件类型
-                is_llm_def = True      # 标记为 LLM 输出
+                for def_name in ctx.defs:
+                    if def_name not in frame.f_locals: continue
+                    def_obj = frame.f_locals[def_name]
+                    def_keys = expand_object_keys(def_obj)
+                    for key in def_keys:
+                        val = get_value_by_key(def_obj, key)
+                        def_node = global_trace.new_def_node(
+                            scope_id, def_name, key, val_obj=val, is_query_output=is_llm_def
+                        )
+                        global_trace.add_event(def_node, current_use_nodes, stmt_type)
             
+            # [Case B] Single Query (x = query(...))
             elif ctx.is_query:
+                stmt_type = 'llm_invoke'
+                is_llm_def = True
+                # 1. 获取显式参数依赖 (Explicit Args)
                 # Query 模式：依赖 Snapshot 中的所有 keys
                 line_uses = []
                 for use_var, keys in ctx.use_snapshots.items():
@@ -282,79 +295,106 @@ class ExecutionTracer:
                     global_trace.buffer_query_dependency(line_uses)
                     return # 结束
                 
-                # Invoke Mode
+                # Invoke Mode : 消费 Buffer + 当前参数
                 buffered_deps = global_trace.consume_query_dependencies()
                 current_use_nodes = line_uses + buffered_deps
-                stmt_type = 'llm_invoke'
-                is_llm_def = True
+                
+                for def_name in ctx.defs:
+                    if def_name not in frame.f_locals: continue
+                    def_obj = frame.f_locals[def_name]
+                    def_keys = expand_object_keys(def_obj)
+                    for key in def_keys:
+                        val = get_value_by_key(def_obj, key)
+                        def_node = global_trace.new_def_node(
+                            scope_id, def_name, key, val_obj=val, is_query_output=True
+                        )
+                        global_trace.add_event(def_node, current_use_nodes, stmt_type)
+            
+            # [Case C] 普通 For Loop (for x in nums)
             elif ctx.is_for_loop:
-                # [NEW] For 循环的特殊处理
-                # 我们需要找到 def_val 对应 use_obj 中的哪个 key (Index)
-                # 这是一个"反向查找"过程
-                
-                # 假设通常只有一个 iterator (for x in nums)
-                # 如果有多个 (for x in zip(a, b)) 情况较复杂，这里优先处理单迭代器
-                iterator_var_name = list(ctx.use_snapshots.keys())[0]
-                iterator_obj = ctx.use_objects_ref.get(iterator_var_name)
-                
-                # 获取当前循环变量的值 (DEF value)
-                # 假设只有一个 target (for x in ...)
-                loop_var_name = list(ctx.defs)[0] if ctx.defs else None
-                current_loop_val = frame.f_locals.get(loop_var_name) if loop_var_name else None
-                
-                matched_key = None
-                
-                # 尝试反向匹配：在 iterator_obj 中寻找 current_loop_val
-                if iterator_obj is not None and current_loop_val is not None:
-                    # Case List/Tuple: 寻找 value 相同的 index
-                    if isinstance(iterator_obj, (list, tuple)):
-                        # 优先匹配 Identity (is)
-                        for i, item in enumerate(iterator_obj):
-                            if item is current_loop_val:
-                                matched_key = i
-                                break
-                        # 回退匹配 Equality (==)
-                        if matched_key is None:
-                            for i, item in enumerate(iterator_obj):
-                                if item == current_loop_val:
-                                    matched_key = i
-                                    break
-                    
-                    # Case Dict: 迭代的是 Key
-                    elif isinstance(iterator_obj, dict):
-                        if current_loop_val in iterator_obj:
-                            matched_key = current_loop_val # Key 就是 Value
-                
-                # 如果找到了精确的 Key，就只依赖这个 Key
-                if matched_key is not None:
-                    current_use_nodes.append(global_trace.get_current_node(scope_id, iterator_var_name, matched_key))
-                else:
-                    # 没找到 (或者是 generator 等无法遍历的)，依赖整体
-                    current_use_nodes.append(global_trace.get_current_node(scope_id, iterator_var_name, None))
-                
                 stmt_type = 'loop_iter'
-            else:
-                # 普通赋值模式
-                for use_var, keys in ctx.use_snapshots.items():
-                    for key in keys:
-                        current_use_nodes.append(global_trace.get_current_node(scope_id, use_var, key))
-                stmt_type = 'assignment'
-
-            # 2. 构建 DEF 节点 (基于当前 Locals)
-            # Defs 代表执行后的结果，所以查看 frame.f_locals
-            for def_name in ctx.defs:
-                if def_name not in frame.f_locals: continue
-
-                def_obj = frame.f_locals[def_name]
-                def_keys = expand_object_keys(def_obj)
                 
-                for key in def_keys:
-                    # 创建新版本
-                    val = get_value_by_key(def_obj, key)
-                    def_node = global_trace.new_def_node(scope_id, def_name, key, val, is_query_output=is_llm_def)
+                # 准备迭代器信息 (Assuming single iterator for simplicity)
+                iterator_var = list(ctx.use_snapshots.keys())[0]
+                iterator_obj = ctx.use_objects_ref.get(iterator_var)
+                
+                for def_name in ctx.defs:
+                    if def_name not in frame.f_locals: continue
+                    def_obj = frame.f_locals[def_name] # Current Loop Variable Value
+                    
+                    # 循环变量通常是标量，但如果是 for a,b in ... 则可能是解包
+                    # 这里简化处理：假设 def_obj 本身就是我们要找的值
+                    
+                    # [反向查找逻辑]
+                    matched_key = None
+                    if iterator_obj is not None:
+                        if isinstance(iterator_obj, list):
+                            try: 
+                                # 优先 Identity
+                                for i, item in enumerate(iterator_obj):
+                                    if item is def_obj: 
+                                        matched_key = i; break
+                                # 其次 Equality
+                                if matched_key is None:
+                                    matched_key = iterator_obj.index(def_obj)
+                            except: pass
+                        elif isinstance(iterator_obj, dict):
+                            if def_obj in iterator_obj:
+                                matched_key = def_obj
+                    
+                    # 构建依赖
+                    current_deps = []
+                    if matched_key is not None:
+                        current_deps.append(global_trace.get_current_node(scope_id, iterator_var, matched_key))
+                    else:
+                        # Fallback: 依赖整体
+                        current_deps.append(global_trace.get_current_node(scope_id, iterator_var, None))
+                    
+                    # 创建节点
+                    # 循环变量的 keys 通常是 [None] (标量)，除非它是 tuple 解包
+                    def_keys = expand_object_keys(def_obj)
+                    for key in def_keys:
+                        val = get_value_by_key(def_obj, key)
+                        def_node = global_trace.new_def_node(
+                            scope_id, def_name, key, val_obj=val, is_query_output=False
+                        )
+                        global_trace.add_event(def_node, current_deps, stmt_type)
+            # [Case D] 普通赋值
+            else:
+                stmt_type = 'assignment'
+                
+                for def_name in ctx.defs:
+                    if def_name not in frame.f_locals: continue
+                    def_obj = frame.f_locals[def_name]
+                    def_keys = expand_object_keys(def_obj)
+                    
+                    for key in def_keys:
+                        val = get_value_by_key(def_obj, key)
+                        def_node = global_trace.new_def_node(
+                            scope_id, def_name, key, val_obj=val, is_query_output=False
+                        )
+                        
+                        current_deps = []
+                        
+                        # [策略 B] 点对点匹配 (Point-to-Point Matching)
+                        # 条件: 只有 1 个 USE 变量 (e.g. slicing, copy)
+                        if len(ctx.use_snapshots) == 1:
+                            use_name = list(ctx.use_snapshots.keys())[0]
+                            use_keys_snapshot = ctx.use_snapshots[use_name]
+                            
+                            if key in use_keys_snapshot:
+                                # Hit! DEF[k] <- USE[k]
+                                current_deps.append(global_trace.get_current_node(scope_id, use_name, key))
+                            else:
+                                # Miss: Fallback to Broadcast
+                                current_deps.append(global_trace.get_current_node(scope_id, use_name, None))
+                        
+                        # [策略 C] 广播 / 表达式计算 (Broadcasting)
+                        else:
+                            for use_var in ctx.use_snapshots.keys():
+                                current_deps.append(global_trace.get_current_node(scope_id, use_var, None))
 
-                    # 匹配逻辑 (简化为全量依赖，真正的 Element-wise 需更复杂 AST 分析)
-                    global_trace.add_event(def_node, current_use_nodes, stmt_type)
+                        global_trace.add_event(def_node, current_deps, stmt_type)
             
             # 3. 处理 Return 传递 (如果该行包含 return 语句)
             if ctx.return_var:
@@ -532,7 +572,7 @@ class ExecutionTracer:
                 lineno = frame.f_lineno - start_line
                 if 0 <= lineno < len(lines):
                     source_line = lines[lineno]
-                    defs, uses, is_query, return_var, is_for_loop, call_func_name = parse_line_analysis(source_line)
+                    defs, uses, is_query, return_var, is_for_loop, called_funcs = parse_line_analysis(source_line)
 
                     # [PERFECT FIX] Snapshot Logic
                     # 在代码执行前，记录所有 USE 变量的 keys
@@ -567,7 +607,7 @@ class ExecutionTracer:
                             use_snapshots=use_snapshots, # <-- 存入快照
                             use_objects_ref=use_objects_ref, # <-- 存入对象引用
                             is_for_loop=is_for_loop,
-                            call_func_name=call_func_name
+                            called_functions=called_funcs
                         )
 
             except Exception:
